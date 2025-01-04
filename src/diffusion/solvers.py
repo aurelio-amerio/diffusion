@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 import jax.random as random
 from jax import vmap
-from diffusionjax.utils import (
+from .utils import (
   batch_mul,
   batch_mul_A,
   get_times,

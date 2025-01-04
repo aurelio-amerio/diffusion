@@ -2,7 +2,7 @@
 
 import jax.numpy as jnp
 from jax import random, vmap
-from diffusionjax.utils import (
+from .utils import (
   batch_mul,
   get_exponential_sigma_function,
   get_linear_beta_function,
