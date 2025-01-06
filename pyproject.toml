@@ -13,6 +13,8 @@ dependencies = [
     "numpy>=2.1",
     "flax>=0.6.0",
     "diffrax>=0.6.0",
+    "numpyro>=0.16.0",
+    "tqdm>=4.62.0",
 ]
 
 [project.urls]
