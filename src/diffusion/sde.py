@@ -1,249 +1,224 @@
-"""SDE class."""
+# we define a base class for the forward and reverse sde
+# to avoid code duplication
 
+# for each sde, we define the drift, diffusion and marginals 
+# for the reverse sde, we implement a sampler given a solver using diffrax
+# the reverse sde is defined from the forward sde
+
+import abc
 import jax.numpy as jnp
-from jax import random, vmap
-from .utils import (
-  batch_mul,
-  get_exponential_sigma_function,
-  get_linear_beta_function,
-)
+import jax
+from jax import grad, jit, vmap
+import jax.random as random
+from functools import partial
+from diffrax import diffeqsolve, ControlTerm, MultiTerm, ODETerm, VirtualBrownianTree, UnsafeBrownianPath, DirectAdjoint
+
+import numpyro
+import numpyro.distributions as dist
+
+from typing import Callable
+
+class BaseSDE(abc.ABC):
+    def __init__(self, dim):
+        self.dim = dim
+        pass
+
+    @abc.abstractmethod
+    def drift(self, x, t):
+        """
+        Drift function of the SDE.
+        """
+        pass
+
+    @abc.abstractmethod
+    def diffusion(self, x, t):
+        """
+        Diffusion function of the SDE.
+        """
+        pass
+
+    @abc.abstractmethod
+    def marginal_prob(self, x0, t):
+        """
+        Marginal probability.
+        """
+        pass
+
+    @abc.abstractmethod
+    def prior_log_prob(self, rng, shape):
+        """
+        Log probability of the prior. This is the distribution to which we converge at the end of the diffusion process.
+        """
+        pass
+    
+    @abc.abstractmethod
+    def reverse(self):
+        """
+        Return the reverse SDE.
+        """
+        pass
+
+    @abc.abstractmethod
+    def get_loss_function(self):
+        """
+        Get the loss function for denoising score matching.
+        """
+        pass
+
+class ReverseSDE(BaseSDE):
+    def __init__(self, forward_sde: BaseSDE, score: Callable, dim, **kwargs):
+        super().__init__(dim, **kwargs)
+        self.forward_sde = forward_sde
+        self.score = score
+
+    def drift(self, x, t):
+        """
+        Drift function of the reverse SDE.
+        """
+        forward_drift = self.forward_sde.drift
+        diffusion = self.forward_sde.diffusion
+        # to obtain a process for the reverse time, we need to reverse the drift and diffusion of the forward sde
+        res = -forward_drift(x, 1-t) + jnp.multiply(jnp.square(diffusion(x, 1-t)), self.score(x, 1-t))
+        return res
+
+    def diffusion(self, x, t):
+        """
+        Diffusion function of the reverse SDE.
+        """
+        return self.diffusion(x, 1-t)
 
 
-def ulangevin(score, x, t):
-  drift = -score(x, t)
-  diffusion = jnp.ones(x.shape) * jnp.sqrt(2)
-  return drift, diffusion
+    def sample(self, rng, n_samples, solver, safe=True):
+        """
+        Sample from the reverse SDE.
+        """
+        t0, t1 = 0., 0.999
+        def diff(t,y,args):
+            return jnp.diag(jnp.broadcast_to(self.diffusion(y,t), (self.dim,)))
+        def drift(t,y,args):
+            return self.drift(y,t)
+
+        keys = jax.random.split(rng, n_samples)
+
+        @jit
+        def sample_one(key):
+            keys = jax.random.split(key, 2)
+            y0 = jax.random.normal(keys[0], (self.dim,))
+
+            brownian_motion = VirtualBrownianTree(t0, t1, tol=1e-5, shape=(self.dim,), key=keys[1])
+            terms = MultiTerm(ODETerm(drift), ControlTerm(diff, brownian_motion))
+            sol = diffeqsolve(terms, solver, t0, t1, dt0=0.001, y0=y0)
+            return sol.ys
+        
+        @jit
+        def sample_one_unsafe(key):
+            keys = jax.random.split(key, 2)
+            y0 = jax.random.normal(keys[0], (self.dim,))
+
+            brownian_motion = UnsafeBrownianPath(shape=(self.dim,), key=keys[1])
+            terms = MultiTerm(ODETerm(drift), ControlTerm(diff, brownian_motion))
+            sol = diffeqsolve(terms, solver, t0, t1, dt0=0.001, y0=y0, adjoint=DirectAdjoint())
+            return sol.ys
+        
+        if safe:
+            return vmap(sample_one)(keys)
+        else:
+            return vmap(sample_one_unsafe)(keys)
+    
 
 
-class ULangevin:
-  """Unadjusted Langevin SDE."""
 
-  def __init__(self, score):
-    self.score = score
-    self.sde = lambda x, t: ulangevin(self.score, x, t)
-
-
-class RSDE:
-  """Reverse SDE class."""
-
-  def __init__(self, score, forward_sde, *args, **kwargs):
-    super().__init__(*args, **kwargs)
-    self.score = score
-    self.forward_sde = forward_sde
-
-  def sde(self, x, t):
-    drift, diffusion = self.forward_sde(x, t)
-    drift = -drift + batch_mul(diffusion**2, self.score(x, t))
-    return drift, diffusion
-
-
-class VE:
-  """Variance exploding (VE) SDE, a.k.a. diffusion process with a time dependent diffusion coefficient."""
-
-  def __init__(self, sigma=None):
-    if sigma is None:
-      self.sigma = get_exponential_sigma_function(sigma_min=0.01, sigma_max=378.0)
-    else:
-      self.sigma = sigma
-    self.sigma_min = self.sigma(0.0)
-    self.sigma_max = self.sigma(1.0)
-
-  def sde(self, x, t):
-    sigma_t = self.sigma(t)
-    drift = jnp.zeros_like(x)
-    diffusion = sigma_t * jnp.sqrt(
-      2 * (jnp.log(self.sigma_max) - jnp.log(self.sigma_min))
-    )
-
-    return drift, diffusion
-
-  def mean_coeff(self, t):
-    return jnp.ones_like(t)
-
-  def variance(self, t):
-    return self.sigma(t) ** 2
-
-  def prior(self, rng, shape):
-    return random.normal(rng, shape) * self.sigma_max
-
-  def reverse(self, score):
-    forward_sde = self.sde
-    sigma = self.sigma
-
-    return RVE(score, forward_sde, sigma)
-
-  def r2(self, t, data_variance):
-    r"""Analytic variance of the distribution at time zero conditioned on x_t, given crude assumption that
-    the data distribution is isotropic-Gaussian.
-
-    .. math::
-      \text{Variance of }p_{0}(x_{0}|x_{t}) \text{ if } p_{0}(x_{0}) = \mathcal{N}(0, \text{data_variance}I)
-      \text{ and } p_{t|0}(x_{t}|x_{0}) = \mathcal{N}(x_0, \sigma_{t}^{2}I)
+class VPSDE(BaseSDE):
     """
-    variance = self.variance(t)
-    return variance * data_variance / (variance + data_variance)
-
-  def ratio(self, t):
-    """Ratio of marginal variance and mean coeff."""
-    return self.variance(t)
-
-
-class VP:
-  """Variance preserving (VP) SDE, a.k.a. time rescaled Ohrnstein Uhlenbeck (OU) SDE."""
-
-  def __init__(self, beta=None, mean_coeff=None):
-    if beta is None:
-      self.beta, self.mean_coeff = get_linear_beta_function(
-        beta_min=0.1, beta_max=20.0
-      )
-    else:
-      self.beta = beta
-      self.mean_coeff = mean_coeff
-
-  def sde(self, x, t):
-    beta_t = self.beta(t)
-    drift = -0.5 * batch_mul(beta_t, x)
-    diffusion = jnp.sqrt(beta_t)
-    return drift, diffusion
-
-  def std(self, t):
-    return jnp.sqrt(self.variance(t))
-
-  def variance(self, t):
-    return 1.0 - self.mean_coeff(t)**2
-
-  def marginal_prob(self, x, t):
-    return batch_mul(self.mean_coeff(t), x), jnp.sqrt(self.variance(t))
-
-  def prior(self, rng, shape):
-    return random.normal(rng, shape)
-
-  def reverse(self, score):
-    fwd_sde = self.sde
-    beta = self.beta
-    mean_coeff = self.mean_coeff
-    return RVP(score, fwd_sde, beta, mean_coeff)
-
-  def r2(self, t, data_variance):
-    r"""Analytic variance of the distribution at time zero conditioned on x_t, given crude assumption that
-    the data distribution is isotropic-Gaussian.
-
-    .. math::
-      \text{Variance of }p_{0}(x_{0}|x_{t}) \text{ if } p_{0}(x_{0}) = \mathcal{N}(0, \text{data_variance}I)
-      \text{ and } p_{t|0}(x_{t}|x_{0}) = \mathcal{N}(\sqrt(\alpha_{t})x_0, (1 - \alpha_{t})I)
+    Variance Preseverving SDE, also known as the Ornstein-Uhlenbeck SDE.
     """
-    alpha = self.mean_coeff(t)**2
-    variance = 1.0 - alpha
-    return variance * data_variance / (variance + alpha * data_variance)
+    def __init__(self, dim, beta_min: float, beta_max: float):
+        super().__init__(dim)
+        self.diff_steps = 1000
+        self.beta_min = beta_min
+        self.beta_max = beta_max
+        self.prior_distibution = dist.MultivariateNormal(loc=jnp.zeros(self.dim), covariance_matrix=jnp.eye(self.dim))
+        return
+    
+    def beta_t(self, t):
+        """
+        Beta function of the VPSDE.
+        """
+        return self.beta_min + (self.beta_max - self.beta_min)*t
+    
+    def alpha_t(self, t):
+        """
+        Alpha function of the VPSDE.
+        """
+        return t*self.beta_min + 0.5 * t**2 * (self.beta_max - self.beta_min)
+    
 
-  def ratio(self, t):
-    """Ratio of marginal variance and mean coeff."""
-    return self.variance(t) / self.mean_coeff(t)
+    def drift(self, x, t):
+        """
+        Drift function of the VPSDE.
+        """
+        return -0.5*self.beta_t(t)*x
 
+    def diffusion(self, x, t):
+        """
+        Diffusion function of the VPSDE.
+        """
+        return jnp.sqrt(self.beta_t(t))
 
-class RVE(RSDE, VE):
-  def get_estimate_x_0_vmap(self, observation_map):
-    """
-    Get a function returning the MMSE estimate of x_0|x_t.
+    def mean_factor(self, t):
+        """
+        t: time (number)
+        returns m_t as above
+        """
+        return jnp.exp(-0.5 * self.alpha_t(t))
 
-    Args:
-      observation_map: function that operates on unbatched x.
-      shape: optional tuple that reshapes x so that it can be operated on.
-    """
+    def var(self, t):
+        """
+        t: time (number)
+        returns v_t as above
+        """
+        return 1 - jnp.exp(-self.alpha_t(t))
 
-    def estimate_x_0(x, t):
-      x = jnp.expand_dims(x, axis=0)
-      t = jnp.expand_dims(t, axis=0)
-      v_t = self.variance(t)
-      s = self.score(x, t)
-      x_0 = x + v_t * s
-      return observation_map(x_0), (s, x_0)
+    def marginal_dist(self, x0, t):
+        """
+        Marginal probability of the VPSDE.
+        """
+        mean_coeff = self.mean_factor(t)
+        var_coeff = self.var(t)
+        std = jnp.sqrt(var_coeff)
+        covar = jnp.diag(std)
+        return dist.MultivariateNormal(loc=mean_coeff*x0, covariance_matrix=covar)
+    
+    def reverse(self, score):
+        """
+        Return the reverse VPSDE.
+        """
+        return R_VPSDE(self, score, self.dim)
+    
+    def get_loss_function(self):
+        """
+        Get the loss function for denoising score matching.
+        """
 
-    return estimate_x_0
+        def loss_fn(score_model, x0, rng):
+            N_batch = x0.shape[0]
+            rng, step_key = random.split(rng)
+            t = random.randint(step_key , (N_batch,1), 1, self.diff_steps)/(self.diff_steps-1)
+            mean_coeff = self.mean_factor(t)
+            #is it right to have the square root here for the loss?
+            vs = self.var(t)
+            stds = jnp.sqrt(vs)
+            rng, step_key = random.split(rng)
+            noise = random.normal(step_key, x0.shape)
+            xt = x0 * mean_coeff + noise * stds
+            output = score_model(xt, t)
+            loss = jnp.mean((noise + output*stds)**2)
+            return loss
 
-  def get_estimate_x_0(self, observation_map, shape=None):
-    """
-    Get a function returning the MMSE estimate of x_0|x_t.
+        return loss_fn
+    
 
-    Args:
-      observation_map: function that operates on unbatched x.
-      shape: optional tuple that reshapes x so that it can be operated on.
-    """
-    batch_observation_map = vmap(observation_map)
-
-    def estimate_x_0(x, t):
-      v_t = self.variance(t)
-      s = self.score(x, t)
-      x_0 = x + batch_mul(v_t, s)
-      if shape:
-        return batch_observation_map(x_0.reshape(shape)), (s, x_0)
-      else:
-        return batch_observation_map(x_0), (s, x_0)
-
-    return estimate_x_0
-
-  def guide(self, get_guidance_score, observation_map, *args, **kwargs):
-    guidance_score = get_guidance_score(self, observation_map, *args, **kwargs)
-    return RVE(guidance_score, self.forward_sde, self.sigma)
-
-  def correct(self, corrector):
-    class CVE(RVE):
-      def sde(x, t):
-        return corrector(self.score, x, t)
-
-    return CVE(self.score, self.forward_sde, self.sigma)
-
-
-class RVP(RSDE, VP):
-  def get_estimate_x_0_vmap(self, observation_map):
-    """
-    Get a function returning the MMSE estimate of x_0|x_t.
-
-    Args:
-      observation_map: function that operates on unbatched x.
-      shape: optional tuple that reshapes x so that it can be operated on.
-    """
-
-    def estimate_x_0(x, t):
-      x = jnp.expand_dims(x, axis=0)
-      t = jnp.expand_dims(t, axis=0)
-      m_t = self.mean_coeff(t)
-      v_t = self.variance(t)
-      s = self.score(x, t)
-      x_0 = (x + v_t * s) / m_t
-      return observation_map(x_0), (s, x_0)
-
-    return estimate_x_0
-
-  def get_estimate_x_0(self, observation_map, shape=None):
-    """
-    Get a function returning the MMSE estimate of x_0|x_t.
-
-    Args:
-      observation_map: function that operates on unbatched x.
-      shape: optional tuple that reshapes x so that it can be operated on.
-    """
-    batch_observation_map = vmap(observation_map)
-
-    def estimate_x_0(x, t):
-      m_t = self.mean_coeff(t)
-      v_t = self.variance(t)
-      s = self.score(x, t)
-      x_0 = batch_mul(x + batch_mul(v_t, s), 1.0 / m_t)
-      if shape:
-        return batch_observation_map(x_0.reshape(shape)), (s, x_0)
-      else:
-        return batch_observation_map(x_0), (s, x_0)
-
-    return estimate_x_0
-
-  def guide(self, get_guidance_score, observation_map, *args, **kwargs):
-    guidance_score = get_guidance_score(self, observation_map, *args, **kwargs)
-    return RVP(guidance_score, self.forward_sde, self.beta, self.mean_coeff)
-
-  def correct(self, corrector):
-    class CVP(RVP):
-      def sde(x, t):
-        return corrector(self.score, x, t)
-
-    return CVP(self.score, self.forward_sde, self.beta, self.mean_coeff)
+class R_VPSDE(ReverseSDE):
+    def __init__(self, forward_sde, score, dim, **kwargs):
+        super().__init__(forward_sde, score, dim, **kwargs)
+        return
