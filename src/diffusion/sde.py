@@ -28,10 +28,22 @@ from typing import Callable
 
 
 class BaseSDE(abc.ABC):
-    def __init__(self, dim, prior_dist):
+    def __init__(self, dim, prior_dist: dist.Distribution, diff_steps: int=1000):
         self.dim = dim
-        self.prior_dist = prior_dist
+        self._prior_dist = prior_dist
+        self._diff_steps = diff_steps
+        return
+
+    @property
+    @abc.abstractmethod
+    def T(self):
+        """End time of the SDE."""
         pass
+
+    @property
+    def diff_steps(self):
+        """Diffusion steps of the forward SDE."""
+        return self._diff_steps
 
     @abc.abstractmethod
     def drift(self, x, t):
@@ -53,6 +65,17 @@ class BaseSDE(abc.ABC):
         Marginal probability.
         """
         pass
+
+    @property
+    def prior_dist(self) -> dist.Distribution:
+        """The prior distribution."""
+        return self._prior_dist
+
+    def prior_sample(self, rng, shape):
+        """
+        Sample from the prior distribution.
+        """
+        return self._prior_dist.sample(rng, shape)
 
     @abc.abstractmethod
     def reverse(self):
@@ -90,8 +113,8 @@ class ReverseSDE(abc.ABC):
         forward_drift = self.forward_sde.drift
         diffusion = self.forward_sde.diffusion
         # to obtain a process for the reverse time, we need to reverse the drift and diffusion of the forward sde
-        res = -forward_drift(x, 1 - t) + jnp.multiply(
-            jnp.square(diffusion(x, 1 - t)), jnp.squeeze(self.score(x, 1 - t))
+        res = forward_drift(x, t) - jnp.multiply(
+            jnp.square(diffusion(x, t)), jnp.squeeze(self.score(x, t))
         )
         return res
 
@@ -99,13 +122,14 @@ class ReverseSDE(abc.ABC):
         """
         Diffusion function of the reverse SDE.
         """
-        return self.forward_sde.diffusion(x, 1 - t)
+        return self.forward_sde.diffusion(x, t)
 
-    def sample(self, rng, n_samples, solver=Euler(), safe=True):
+    def sample(self, rng, n_samples, solver=Euler(), safe=True, n_steps=1000, eps=0.001):
         """
         Sample from the reverse SDE.
         """
-        t0, t1 = 0.0, 0.999
+        t0, t1 = self.forward_sde.T, eps #we are going from T to 0 in the reverse process
+        dt = -t0 / n_steps
 
         def diff(t, y, args):
             return jnp.diag(jnp.broadcast_to(self.diffusion(y, t), (self.dim,)))
@@ -113,36 +137,32 @@ class ReverseSDE(abc.ABC):
         def drift(t, y, args):
             return self.drift(y, t)
 
+        rng, key = jax.random.split(rng)
+        y0s = jnp.squeeze(self.forward_sde.prior_sample(key, (n_samples,)))
+
         keys = jax.random.split(rng, n_samples)
 
         @jit
-        def sample_one(key):
-            keys = jax.random.split(key, 2)
-            y0 = jax.random.normal(keys[0], (self.dim,))
-
-            brownian_motion = VirtualBrownianTree(
-                t0, t1, tol=1e-5, shape=(self.dim,), key=keys[1]
-            )
+        def sample_one(key, y0):
+            brownian_motion = VirtualBrownianTree(t1, t0, tol=1e-5, shape=(self.dim,), key=key)
             terms = MultiTerm(ODETerm(drift), ControlTerm(diff, brownian_motion))
-            sol = diffeqsolve(terms, solver, t0, t1, dt0=0.001, y0=y0)
+            sol = diffeqsolve(terms, solver, t0, t1, dt0=dt, y0=y0)
             return sol.ys
 
         @jit
-        def sample_one_unsafe(key):
-            keys = jax.random.split(key, 2)
-            y0 = jax.random.normal(keys[0], (self.dim,))
+        def sample_one_unsafe(key, y0):
+            brownian_motion = UnsafeBrownianPath(shape=(self.dim,), key=key)
 
-            brownian_motion = UnsafeBrownianPath(shape=(self.dim,), key=keys[1])
             terms = MultiTerm(ODETerm(drift), ControlTerm(diff, brownian_motion))
             sol = diffeqsolve(
-                terms, solver, t0, t1, dt0=0.001, y0=y0, adjoint=DirectAdjoint()
+                terms, solver, t0, t1, dt0=dt, y0=y0, adjoint=DirectAdjoint()
             )
             return sol.ys
 
         if safe:
-            res = vmap(sample_one)(keys)
+            res = vmap(sample_one, in_axes=(0, 0))(keys, y0s)
         else:
-            res = vmap(sample_one_unsafe)(keys)
+            res = vmap(sample_one_unsafe, in_axes=(0, 0))(keys, y0s)
 
         return jnp.squeeze(res)
 
@@ -160,15 +180,18 @@ class VPSDE(BaseSDE):
     Variance Preseverving SDE, also known as the Ornstein-Uhlenbeck SDE.
     """
 
-    def __init__(self, dim, beta_min: float = 0.001, beta_max: float = 3.):
+    def __init__(self, dim, beta_min: float = 0.001, beta_max: float = 3., diff_steps=1000):
         prior_dist = dist.MultivariateNormal(
             loc=jnp.zeros(dim), covariance_matrix=jnp.eye(dim)
         )
-        super().__init__(dim, prior_dist)
-        self.diff_steps = 1000
+        super().__init__(dim, prior_dist, diff_steps)
         self.beta_min = beta_min
         self.beta_max = beta_max
         return
+    
+    @property
+    def T(self):
+        return 1
 
     def beta_t(self, t):
         """
@@ -194,14 +217,14 @@ class VPSDE(BaseSDE):
         """
         return jnp.sqrt(self.beta_t(t))
 
-    def mean_factor(self, t):
+    def mean_coeff(self, t):
         """
         t: time (number)
         returns m_t as above
         """
         return jnp.exp(-0.5 * self.alpha_t(t))
 
-    def var(self, t):
+    def variance(self, t):
         """
         t: time (number)
         returns v_t as above
@@ -212,11 +235,14 @@ class VPSDE(BaseSDE):
         """
         Marginal probability of the VPSDE.
         """
-        mean_coeff = self.mean_factor(t)
-        var_coeff = self.var(t)
+        mean_coeff = self.mean_coeff(t)
+        var_coeff = self.variance(t)
         std = jnp.sqrt(var_coeff)
         covar = jnp.diag(std)
         return dist.MultivariateNormal(loc=mean_coeff * x0, covariance_matrix=covar)
+    
+    # def prior_sample(self, rng, shape):
+    #     return jax.random.normal(rng, shape)
 
     def reverse(self, score):
         """
@@ -235,9 +261,9 @@ class VPSDE(BaseSDE):
             t = random.randint(step_key, (N_batch, 1), 1, self.diff_steps) / (
                 self.diff_steps - 1
             )
-            mean_coeff = self.mean_factor(t)
+            mean_coeff = self.mean_coeff(t)
             # is it right to have the square root here for the loss?
-            vs = self.var(t)
+            vs = self.variance(t)
             stds = jnp.sqrt(vs)
             rng, step_key = random.split(rng)
             noise = random.normal(step_key, x0.shape)
@@ -252,12 +278,125 @@ class VPSDE(BaseSDE):
 
         children = (None,)  # arrays / dynamic values
 
-        aux_data = {"dim": self.dim, "prior_dist": self.prior_dist}  # static values
+        aux_data = {"dim": self.dim, "prior_dist": self.prior_dist, "diff_steps":self.diff_steps, "beta_min":self.beta_min,
+        "beta_max": self.beta_max}  # static values
 
         return (children, aux_data)
 
 
 class R_VPSDE(ReverseSDE):
+    def __init__(self, forward_sde, score, dim, **kwargs):
+        super().__init__(forward_sde, score, dim, **kwargs)
+        return
+
+    def _tree_flatten(self):
+
+        children = (None,)  # arrays / dynamic values
+
+        aux_data = {
+            "dim": self.dim,
+            "forward_sde": self.forward_sde,
+            "score": self.score,
+        }  # static values
+
+        return (children, aux_data)
+    
+
+def get_exponential_sigma_function(sigma_min, sigma_max):
+    log_sigma_min = jnp.log(sigma_min)
+    log_sigma_max = jnp.log(sigma_max)
+
+    @jit
+    def sigma(t):
+        # return sigma_min * (sigma_max / sigma_min)**t  # Has large relative error close to zero compared to alternative, below
+        return jnp.exp(log_sigma_min + t * (log_sigma_max - log_sigma_min))
+
+    return sigma
+    
+
+class VESDE(BaseSDE):
+    """Variance exploding (VE) SDE, a.k.a. diffusion process with a time dependent diffusion coefficient."""
+
+    def __init__(self, dim, sigma_min=0.01, sigma_max=378.0, diff_steps=1000):
+        self.sigma_min = sigma_min
+        self.sigma_max = sigma_max
+        prior_dist = dist.MultivariateNormal(
+            loc=jnp.zeros(dim), covariance_matrix=self.sigma_max*jnp.eye(dim)
+        )
+        super().__init__(dim, prior_dist, diff_steps)
+        self.sigma = get_exponential_sigma_function(sigma_min, sigma_max)
+
+    @property
+    def T(self):
+        """End time of the SDE."""
+        return 1
+
+    def drift(self, x, t):
+        """
+        Drift function of the SDE.
+        """
+        return jnp.zeros_like(x)
+
+    def diffusion(self, x, t):
+        """
+        Diffusion function of the SDE.
+        """
+        sigma_t = self.sigma(t)
+        return sigma_t * jnp.sqrt(2 * (jnp.log(self.sigma_max) - jnp.log(self.sigma_min)))
+    
+
+    def mean_coeff(self, t):
+        return jnp.ones_like(t)
+
+    def variance(self, t):
+        return self.sigma(t) ** 2
+
+    def marginal_dist(self, x0, t):
+        """
+        Marginal probability of the VPSDE.
+        """
+        mean_coeff = self.mean_coeff(t)
+        std = self.sigma(t)
+        covar = jnp.diag(std)
+        return dist.MultivariateNormal(loc=mean_coeff * x0, covariance_matrix=covar)
+
+    def reverse(self, score):
+        """
+        Return the reverse VPSDE.
+        """
+        return R_VESDE(self, score, self.dim)
+    
+    def get_loss_function(self):
+        """
+        Get the loss function for denoising score matching.
+        """
+
+        def loss_fn(score_model, x0, rng):
+            N_batch = x0.shape[0]
+            rng, step_key = random.split(rng)
+            t = random.randint(step_key, (N_batch, 1), 1, self.diff_steps) / (
+                self.diff_steps - 1
+            )
+            mean_coeff = self.mean_coeff(t)
+            # directly compute sdt, as it is given by sigma(t)
+            stds = self.sigma(t)
+            rng, step_key = random.split(rng)
+            noise = random.normal(step_key, x0.shape)
+            xt = x0 * mean_coeff + noise * stds
+            output = score_model(xt, t)
+            loss = jnp.mean((noise + output * stds) ** 2)
+            return loss
+
+        return loss_fn
+
+    def _tree_flatten(self):
+
+        children = (None,)  # arrays / dynamic values
+        aux_data = {"dim": self.dim, "prior_dist": self.prior_dist, "sigma_min":self.sigma_min, "sigma_max":self.sigma_max}  # static values
+
+        return (children, aux_data)
+
+class R_VESDE(ReverseSDE):
     def __init__(self, forward_sde, score, dim, **kwargs):
         super().__init__(forward_sde, score, dim, **kwargs)
         return
