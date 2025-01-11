@@ -62,7 +62,7 @@ class BaseSDE(abc.ABC):
     @abc.abstractmethod
     def marginal_dist(self, x0, t):
         """
-        Marginal probability.
+        Marginal probability p(x_t | x_0)
         """
         pass
 
@@ -78,7 +78,7 @@ class BaseSDE(abc.ABC):
         return self._prior_dist.sample(rng, shape)
 
     @abc.abstractmethod
-    def reverse(self):
+    def reverse(self, score):
         """
         Return the reverse SDE.
         """
@@ -128,7 +128,7 @@ class ReverseSDE(abc.ABC):
         """
         Sample from the reverse SDE.
         """
-        t0, t1 = self.forward_sde.T, eps #we are going from T to 0 in the reverse process
+        t0, t1 = self.forward_sde.T, eps #we are going from T to eps in the reverse process
         dt = -t0 / n_steps
 
         def diff(t, y, args):
@@ -240,10 +240,7 @@ class VPSDE(BaseSDE):
         std = jnp.sqrt(var_coeff)
         covar = jnp.diag(std)
         return dist.MultivariateNormal(loc=mean_coeff * x0, covariance_matrix=covar)
-    
-    # def prior_sample(self, rng, shape):
-    #     return jax.random.normal(rng, shape)
-
+  
     def reverse(self, score):
         """
         Return the reverse VPSDE.
@@ -262,7 +259,6 @@ class VPSDE(BaseSDE):
                 self.diff_steps - 1
             )
             mean_coeff = self.mean_coeff(t)
-            # is it right to have the square root here for the loss?
             vs = self.variance(t)
             stds = jnp.sqrt(vs)
             rng, step_key = random.split(rng)
@@ -278,8 +274,7 @@ class VPSDE(BaseSDE):
 
         children = (None,)  # arrays / dynamic values
 
-        aux_data = {"dim": self.dim, "prior_dist": self.prior_dist, "diff_steps":self.diff_steps, "beta_min":self.beta_min,
-        "beta_max": self.beta_max}  # static values
+        aux_data = {"dim": self.dim, "prior_dist": self.prior_dist, "beta_min":self.beta_min, "beta_max": self.beta_max}  # static values
 
         return (children, aux_data)
 
@@ -317,7 +312,7 @@ def get_exponential_sigma_function(sigma_min, sigma_max):
 class VESDE(BaseSDE):
     """Variance exploding (VE) SDE, a.k.a. diffusion process with a time dependent diffusion coefficient."""
 
-    def __init__(self, dim, sigma_min=0.01, sigma_max=378.0, diff_steps=1000):
+    def __init__(self, dim, sigma_min=1e-3, sigma_max=15.0, diff_steps=1000):
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
         prior_dist = dist.MultivariateNormal(
@@ -392,7 +387,7 @@ class VESDE(BaseSDE):
     def _tree_flatten(self):
 
         children = (None,)  # arrays / dynamic values
-        aux_data = {"dim": self.dim, "prior_dist": self.prior_dist, "sigma_min":self.sigma_min, "sigma_max":self.sigma_max}  # static values
+        aux_data = {"dim": self.dim, "prior_dist": self.prior_dist,"sigma_min":self.sigma_min, "sigma_max":self.sigma_max}  # static values
 
         return (children, aux_data)
 
