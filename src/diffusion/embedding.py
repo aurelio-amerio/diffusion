@@ -9,7 +9,9 @@ class SimpleTimeEmbedding(nnx.Module):
         """
         return 
     def __call__(self, t):
-        t = jnp.atleast_2d(t)
+        t = jnp.atleast_1d(t)
+        if t.ndim == 1:
+            t = jnp.expand_dims(t, axis=1)
         out = jnp.concatenate([
             t - 0.5,
             jnp.cos(2 * jnp.pi * t),
@@ -29,11 +31,16 @@ class SinusoidalEmbedding(nnx.Module):
         self.output_dim = output_dim
         return
 
-    def __call__(self, inputs):
+    def __call__(self, t):
+        t = jnp.atleast_1d(t)
+        if t.ndim == 1:
+            t = jnp.expand_dims(t, axis=1)
         half_dim = self.output_dim // 2 + 1
         emb = jnp.log(10000) / (half_dim - 1)
         emb = jnp.exp(jnp.arange(half_dim) * -emb)
-        emb = inputs[..., None] * emb[None, ...]
+        emb = jnp.expand_dims(emb, 0)
+        # emb = t[..., None] * emb[None, ...]
+        emb = jnp.dot(t, emb)
         emb = jnp.concatenate([jnp.sin(emb), jnp.cos(emb)], -1)
         return emb[..., : self.output_dim]
 
@@ -57,12 +64,17 @@ class GaussianFourierEmbedding(nnx.Module):
         return
 
         
-    def __call__(self, inputs):
+    def __call__(self, t):
+        t = jnp.atleast_1d(t)
+        if t.ndim == 1:
+            t = jnp.expand_dims(t, axis=1)
+
         if not self.learnable:
-            B = jax.lax.stop_gradient(self.B)
+            B = jnp.expand_dims(jax.lax.stop_gradient(self.B), 0)
         else:
-            B = self.B
-        arg = 2 * jnp.pi * inputs[...,None]* B[None,...]
+            B = jnp.expand_dims(self.B, 0)
+
+        arg = 2 * jnp.pi * jnp.dot(t,B)
         term1 = jnp.cos(arg)
         term2 = jnp.sin(arg)
         out = jnp.concatenate([term1, term2], axis=-1)

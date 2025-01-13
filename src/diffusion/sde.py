@@ -247,10 +247,13 @@ class VPSDE(BaseSDE):
         """
         return R_VPSDE(self, score, self.dim)
 
-    def get_loss_function(self):
+    def get_loss_function(self, weight_fn: Callable = None):
         """
         Get the loss function for denoising score matching.
         """
+        if weight_fn is None:
+            # according to https://arxiv.org/abs/2101.09258 , for MLE we use g(t)**2 as weight function
+            weight_fn = lambda t: self.diffusion(1.0, t)**2 
 
         def loss_fn(score_model, x0, rng):
             N_batch = x0.shape[0]
@@ -264,8 +267,9 @@ class VPSDE(BaseSDE):
             rng, step_key = random.split(rng)
             noise = random.normal(step_key, x0.shape)
             xt = x0 * mean_coeff + noise * stds
-            output = score_model(xt, t)
-            loss = jnp.mean((noise + output * stds) ** 2)
+            score_val = score_model(xt, t)
+            weight = weight_fn(t)
+            loss = jnp.sum(weight*(noise + score_val * stds) ** 2)
             return loss
 
         return loss_fn
@@ -361,10 +365,13 @@ class VESDE(BaseSDE):
         """
         return R_VESDE(self, score, self.dim)
     
-    def get_loss_function(self):
+    def get_loss_function(self, weight_fn: Callable = None):
         """
         Get the loss function for denoising score matching.
         """
+        if weight_fn is None:
+            # according to https://arxiv.org/abs/2101.09258 , for MLE we use g(t)**2 as weight function
+            weight_fn = lambda t: self.diffusion(1.0, t)**2 
 
         def loss_fn(score_model, x0, rng):
             N_batch = x0.shape[0]
@@ -378,8 +385,9 @@ class VESDE(BaseSDE):
             rng, step_key = random.split(rng)
             noise = random.normal(step_key, x0.shape)
             xt = x0 * mean_coeff + noise * stds
-            output = score_model(xt, t)
-            loss = jnp.mean((noise + output * stds) ** 2)
+            score_val = score_model(xt, t)
+            weight = weight_fn(t)
+            loss = jnp.sum(weight*(noise + score_val * stds) ** 2)
             return loss
 
         return loss_fn
