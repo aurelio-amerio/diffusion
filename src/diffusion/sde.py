@@ -255,7 +255,8 @@ class VPSDE(BaseSDE):
             # according to https://arxiv.org/abs/2101.09258 , for MLE we use g(t)**2 as weight function
             weight_fn = lambda t: self.diffusion(1.0, t)**2 
 
-        def loss_fn(score_model, x0, rng):
+        
+        def loss_fn(score_model, x0, loss_mask=None, *args, rng, **kwargs):
             N_batch = x0.shape[0]
             rng, step_key = random.split(rng)
             t = random.randint(step_key, (N_batch, 1), 1, self.diff_steps) / (
@@ -267,9 +268,16 @@ class VPSDE(BaseSDE):
             rng, step_key = random.split(rng)
             noise = random.normal(step_key, x0.shape)
             xt = x0 * mean_coeff + noise * stds
-            score_val = score_model(xt, t)
+
+            # if the loss_mask is not None, we use it to mask some features, effectively conditioning on them
+            if loss_mask is not None:
+                loss_mask = loss_mask.reshape(x0.shape)
+                xt = jnp.where(loss_mask, x0, xt)
+
+            score_pred = score_model(xt, t, *args, **kwargs)
+            score_target = -noise/stds
             weight = weight_fn(t)
-            loss = jnp.sum(weight*(noise + score_val * stds) ** 2)
+            loss = jnp.sum(weight*(score_pred - score_target) ** 2)
             return loss
 
         return loss_fn
@@ -349,6 +357,7 @@ class VESDE(BaseSDE):
 
     def variance(self, t):
         return self.sigma(t) ** 2
+    
 
     def marginal_dist(self, x0, t):
         """
@@ -373,7 +382,24 @@ class VESDE(BaseSDE):
             # according to https://arxiv.org/abs/2101.09258 , for MLE we use g(t)**2 as weight function
             weight_fn = lambda t: self.diffusion(1.0, t)**2 
 
-        def loss_fn(score_model, x0, rng):
+        # def loss_fn(score_model, x0, loss_mask=None, *args, rng, **kwargs):
+        #     N_batch = x0.shape[0]
+        #     rng, step_key = random.split(rng)
+        #     t = random.randint(step_key, (N_batch, 1), 1, self.diff_steps) / (
+        #         self.diff_steps - 1
+        #     )
+        #     mean_coeff = self.mean_coeff(t)
+        #     # directly compute sdt, as it is given by sigma(t)
+        #     stds = self.sigma(t)
+        #     rng, step_key = random.split(rng)
+        #     noise = random.normal(step_key, x0.shape)
+        #     xt = x0 * mean_coeff + noise * stds
+        #     score_val = score_model(xt, t, *args, **kwargs)
+        #     weight = weight_fn(t)
+        #     loss = jnp.sum(weight*(noise + score_val * stds) ** 2)
+        #     return loss
+
+        def loss_fn(score_model, x0, loss_mask=None, *args, rng, **kwargs):
             N_batch = x0.shape[0]
             rng, step_key = random.split(rng)
             t = random.randint(step_key, (N_batch, 1), 1, self.diff_steps) / (
@@ -385,9 +411,16 @@ class VESDE(BaseSDE):
             rng, step_key = random.split(rng)
             noise = random.normal(step_key, x0.shape)
             xt = x0 * mean_coeff + noise * stds
-            score_val = score_model(xt, t)
+
+            # if the loss_mask is not None, we use it to mask some features, effectively conditioning on them
+            if loss_mask is not None:
+                loss_mask = loss_mask.reshape(x0.shape)
+                xt = jnp.where(loss_mask, x0, xt)
+
+            score_pred = score_model(xt, t, *args, **kwargs)
+            score_target = -noise/stds
             weight = weight_fn(t)
-            loss = jnp.sum(weight*(noise + score_val * stds) ** 2)
+            loss = jnp.sum(weight*(score_pred - score_target) ** 2)
             return loss
 
         return loss_fn
