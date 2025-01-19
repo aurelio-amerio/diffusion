@@ -1,6 +1,6 @@
 import jax
 import jax.numpy as jnp
-from jax.random import PRNGKeyArray
+from jax.random import PRNGKey
 
 from functools import partial
 from typing import Callable, Union, Optional
@@ -96,18 +96,18 @@ class BaseSDE(Distribution):
         raise NotImplementedError
 
     def marginal_rsample(
-        self, key: PRNGKeyArray, t: Array, sample_shape=(), x0=None, **kwargs
+        self, key: PRNGKey, t: Array, sample_shape=(), x0=None, **kwargs
     ) -> Array:
         raise NotImplementedError
 
-    def marginal_sample(self, key: PRNGKeyArray, t: Array, sample_shape=(), **kwargs):
+    def marginal_sample(self, key: PRNGKey, t: Array, sample_shape=(), **kwargs):
         return self.marginal_rsample(key, t, sample_shape, **kwargs)
 
-    def rsample(self, key: PRNGKeyArray, ts: Array, sample_shape=(), **kwargs) -> Array:
+    def rsample(self, key: PRNGKey, ts: Array, sample_shape=(), **kwargs) -> Array:
         """Samples from the SDE
 
         Args:
-            key (PRNGKeyArray): Random key
+            key (PRNGKey): Random key
             ts (Array): Number of time points to evaluate the SDE
             sample_shape (tuple, optional): Number of samples. Defaults to ().
             **kwargs: Additional arguments to pass to the solver i.e. see sdeint in probjax/utils/sdeint.py for more details
@@ -139,7 +139,7 @@ class BaseSDE(Distribution):
         ys = ys.reshape(sample_shape + self.batch_shape + ts.shape + self.event_shape)
         return ys
 
-    def sample(self, key: PRNGKeyArray, ts: Array, sample_shape=(), **kwargs) -> Array:
+    def sample(self, key: PRNGKey, ts: Array, sample_shape=(), **kwargs) -> Array:
         return self.rsample(key, ts, sample_shape, **kwargs)
 
     def log_prob(self, x: Array, t: Array) -> Array:
@@ -238,7 +238,7 @@ class LinearTimeInvariantSDE(BaseSDE):
         return jnp.squeeze(var, axis=-1)
 
     def sample_marginal(
-        self, key: PRNGKeyArray, t: Array, sample_shape=(), x0=None, **kwargs
+        self, key: PRNGKey, t: Array, sample_shape=(), x0=None, **kwargs
     ) -> Array:
         mean = self.mean(t, x0)
         cov = self.covariance_matrix(t, x0)
@@ -362,14 +362,14 @@ class OrnsteinUhlenbeck(BaseSDE):
         ) + v0 * jnp.exp(-2 * self.theta * t)
 
     def sample_marginal(
-        self, key: PRNGKeyArray, t: Array, sample_shape=(), x0=None, **kwargs
+        self, key: PRNGKey, t: Array, sample_shape=(), x0=None, **kwargs
     ) -> Array:
         mean = self.mean(t, x0)
         std = self.stddev(t, x0)
         eps = jax.random.normal(key, sample_shape + mean.shape)
         return mean + std * eps
 
-    def sample(self, key: PRNGKeyArray, ts: Array, sample_shape=(), **kwargs) -> Array:
+    def sample(self, key: PRNGKey, ts: Array, sample_shape=(), **kwargs) -> Array:
         key_p0, key_Wt = jax.random.split(key)
         seq_len = ts.shape[-1]
 
@@ -546,7 +546,7 @@ class VESDE(LinearTimeVariantSDE):
         return var
 
     def sample_marginal(
-        self, key: PRNGKeyArray, t: Array, sample_shape=(), x0=None, **kwargs
+        self, key: PRNGKey, t: Array, sample_shape=(), x0=None, **kwargs
     ) -> Array:
         mean = self.mean(t, x0)
         std = self.stddev(t, x0)

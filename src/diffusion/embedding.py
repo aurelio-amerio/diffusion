@@ -45,6 +45,43 @@ class SinusoidalEmbedding(nnx.Module):
         return emb[..., : self.output_dim]
 
 
+# class GaussianFourierEmbedding(nnx.Module):
+#     def __init__(
+#         self,
+#         output_dim: int = 128,
+#         learnable: bool = False,
+#         *,
+#         rngs: nnx.Rngs
+#     ):
+#         """Gaussian Fourier embedding module. Mostly used to embed time.
+
+#         Args:
+#             output_dim (int, optional): Output dimesion. Defaults to 128.
+#         """
+#         self.output_dim = output_dim
+#         self.B = nnx.Param(jax.random.normal(rngs.params(), [self.output_dim // 2 + 1]))
+#         self.learnable = learnable
+#         return
+
+        
+#     def __call__(self, t):
+#         t = jnp.atleast_1d(t)
+#         if t.ndim == 1:
+#             t = jnp.expand_dims(t, axis=1)
+
+#         if not self.learnable:
+#             B = jnp.expand_dims(jax.lax.stop_gradient(self.B), 0)
+#         else:
+#             B = jnp.expand_dims(self.B, 0)
+
+#         arg = 2 * jnp.pi * jnp.dot(t,B)
+#         term1 = jnp.cos(arg)
+#         term2 = jnp.sin(arg)
+#         out = jnp.concatenate([term1, term2], axis=-1)
+#         return out[..., : self.output_dim]
+
+
+
 class GaussianFourierEmbedding(nnx.Module):
     def __init__(
         self,
@@ -59,7 +96,8 @@ class GaussianFourierEmbedding(nnx.Module):
             output_dim (int, optional): Output dimesion. Defaults to 128.
         """
         self.output_dim = output_dim
-        self.B = nnx.Param(jax.random.normal(rngs.params(), [self.output_dim // 2 + 1]))
+        half_dim = self.output_dim // 2 + 1
+        self.B = nnx.Param(jax.random.normal(rngs.params(), [half_dim , 1]))
         self.learnable = learnable
         return
 
@@ -69,12 +107,10 @@ class GaussianFourierEmbedding(nnx.Module):
         if t.ndim == 1:
             t = jnp.expand_dims(t, axis=1)
 
-        if not self.learnable:
-            B = jnp.expand_dims(jax.lax.stop_gradient(self.B), 0)
-        else:
-            B = jnp.expand_dims(self.B, 0)
+        # if not self.learnable:
+        # B = jax.lax.stop_gradient(self.B)
 
-        arg = 2 * jnp.pi * jnp.dot(t,B)
+        arg = 2 * jnp.pi * jnp.dot(t,self.B.T)
         term1 = jnp.cos(arg)
         term2 = jnp.sin(arg)
         out = jnp.concatenate([term1, term2], axis=-1)
