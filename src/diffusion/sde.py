@@ -223,6 +223,18 @@ class VPSDE(BaseSDE):
         returns m_t as above
         """
         return jnp.exp(-0.5 * self.alpha_t(t))
+    
+    def marginal_mean(self, x0, t):
+        """
+        Mean of the marginal distribution.
+        """
+        return self.mean_coeff(t) * x0
+    
+    def marginal_std(self, x0, t):
+        """
+        Standard deviation of the marginal distribution.
+        """
+        return jnp.sqrt(self.variance(t))
 
     def variance(self, t):
         """
@@ -275,10 +287,11 @@ class VPSDE(BaseSDE):
                 xt = jnp.where(loss_mask, x0, xt)
 
             score_pred = score_model(xt, t, *args, **kwargs)
-            score_target = -noise/stds
             weight = weight_fn(t)
-            loss = jnp.sum(weight*(score_pred - score_target) ** 2)
-            return loss
+            loss = weight*(noise + score_pred * stds) ** 2
+            if loss_mask is not None:
+                loss = jnp.where(loss_mask, 0.0,loss)
+            loss = jnp.mean(loss)
 
         return loss_fn
 
@@ -358,6 +371,17 @@ class VESDE(BaseSDE):
     def variance(self, t):
         return self.sigma(t) ** 2
     
+    def marginal_mean(self, x0, t):
+        """
+        Mean of the marginal distribution.
+        """
+        return jnp.broadcast_to(self.mean_coeff(t), x0.shape) * x0
+    
+    def marginal_std(self, x0, t):
+        """
+        Standard deviation of the marginal distribution.
+        """
+        return jnp.broadcast_to(self.sigma(t), x0.shape)
 
     def marginal_dist(self, x0, t):
         """
@@ -418,9 +442,12 @@ class VESDE(BaseSDE):
                 xt = jnp.where(loss_mask, x0, xt)
 
             score_pred = score_model(xt, t, *args, **kwargs)
-            score_target = -noise/stds
             weight = weight_fn(t)
-            loss = jnp.sum(weight*(score_pred - score_target) ** 2)
+            loss = weight*(noise + score_pred * stds) ** 2
+            if loss_mask is not None:
+                loss = jnp.where(loss_mask, 0.0,loss)
+            loss = jnp.mean(loss)
+    
             return loss
 
         return loss_fn
