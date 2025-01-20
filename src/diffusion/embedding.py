@@ -45,6 +45,8 @@ class SinusoidalEmbedding(nnx.Module):
         return emb[..., : self.output_dim]
 
 
+
+
 # class GaussianFourierEmbedding(nnx.Module):
 #     def __init__(
 #         self,
@@ -107,10 +109,14 @@ class GaussianFourierEmbedding(nnx.Module):
         if t.ndim == 1:
             t = jnp.expand_dims(t, axis=1)
 
-        # if not self.learnable:
-        # B = jax.lax.stop_gradient(self.B)
+        # B = jax.lax.cond(
+        #     self.learnable,
+        #     lambda: self.B,  # True branch: use B directly
+        #     lambda: jax.lax.stop_gradient(self.B)  # False branch: use B with stop_gradient
+        # )
+        B = self.B
 
-        arg = 2 * jnp.pi * jnp.dot(t,self.B.T)
+        arg = 2 * jnp.pi * jnp.dot(t,B.T)
         term1 = jnp.cos(arg)
         term2 = jnp.sin(arg)
         out = jnp.concatenate([term1, term2], axis=-1)

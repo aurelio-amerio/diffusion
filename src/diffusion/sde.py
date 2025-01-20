@@ -59,12 +59,29 @@ class BaseSDE(abc.ABC):
         """
         pass
 
-    @abc.abstractmethod
     def marginal_dist(self, x0, t):
         """
         Marginal probability p(x_t | x_0)
         """
+        mean_t = self.marginal_mean(x0, t)
+        std_t = self.marginal_stddev(x0, t)
+        covar = jnp.diag(std_t)
+        return dist.MultivariateNormal(loc=mean_t, covariance_matrix=covar)
+
+    @abc.abstractmethod
+    def marginal_mean(self, x0, t):
+        """
+        Mean of the marginal distribution.
+        """
         pass
+
+    @abc.abstractmethod
+    def marginal_stddev(self, x0, t):
+        """
+        Mean of the marginal distribution.
+        """
+        pass
+
 
     @property
     def prior_dist(self) -> dist.Distribution:
@@ -84,12 +101,44 @@ class BaseSDE(abc.ABC):
         """
         pass
 
-    @abc.abstractmethod
-    def get_loss_function(self):
+    def get_loss_function(self, weight_fn: Callable = None):
         """
         Get the loss function for denoising score matching.
         """
-        pass
+        if weight_fn is None:
+            # according to https://arxiv.org/abs/2101.09258 , for MLE we use g(t)**2 as weight function
+            weight_fn = lambda t: self.diffusion(1.0, t)**2 
+
+        
+        def loss_fn(score_model, x0, loss_mask=None, *args, rng, **kwargs):
+            N_batch = x0.shape[0]
+            rng, step_key = random.split(rng)
+            t = random.randint(step_key, (N_batch, 1), 1, self.diff_steps) / (
+                self.diff_steps - 1
+            )
+
+            mean_t = self.marginal_mean(x0, t)
+            std_t = self.marginal_stddev(x0, t)
+
+            rng, step_key = random.split(rng)
+            noise = random.normal(step_key, x0.shape)
+            xt = mean_t + noise * std_t
+
+            # if the loss_mask is not None, we use it to mask some features, effectively conditioning on them
+            if loss_mask is not None:
+                loss_mask = loss_mask.reshape(x0.shape)
+                xt = jnp.where(loss_mask, x0, xt)
+
+            score_pred = score_model(xt, t, *args, **kwargs)
+            weight = weight_fn(t)
+            loss = weight*(noise + score_pred * std_t) ** 2
+            if loss_mask is not None:
+                loss = jnp.where(loss_mask, 0.0,loss)
+
+            loss = jnp.mean(loss)
+            return loss
+
+        return loss_fn
 
     @abc.abstractmethod
     def _tree_flatten(self):
@@ -106,7 +155,7 @@ class ReverseSDE(abc.ABC):
         self.forward_sde = forward_sde
         self.score = score
 
-    def drift(self, x, t):
+    def drift(self, x, t, condition_mask=0, score_args={}):
         """
         Drift function of the reverse SDE.
         """
@@ -114,31 +163,40 @@ class ReverseSDE(abc.ABC):
         diffusion = self.forward_sde.diffusion
         # to obtain a process for the reverse time, we need to reverse the drift and diffusion of the forward sde
         res = forward_drift(x, t) - jnp.multiply(
-            jnp.square(diffusion(x, t)), jnp.squeeze(self.score(x, t))
+            jnp.square(diffusion(x, t)), jnp.squeeze(self.score(x, t, **score_args))
         )
-        return res
+        return res*(1-condition_mask)
 
-    def diffusion(self, x, t):
+    def diffusion(self, x, t, condition_mask=0):
         """
         Diffusion function of the reverse SDE.
         """
-        return self.forward_sde.diffusion(x, t)
+        return self.forward_sde.diffusion(x, t)*(1-condition_mask)
 
-    def sample(self, rng, n_samples, solver=Euler(), safe=True, n_steps=1000, eps=0.001):
+    def sample(self, rng, n_samples, condition_mask=None, condition_value=None, solver=Euler(), safe=True, n_steps=1000, eps=0.001, score_args={}):
         """
         Sample from the reverse SDE.
         """
         t0, t1 = self.forward_sde.T, eps #we are going from T to eps in the reverse process
         dt = -t0 / n_steps
 
+        if condition_mask is not None:
+            assert condition_value is not None, "Condition value must be provided if condition mask is provided"
+        else:
+            condition_mask = 0
+            condition_value = 0 
+        
+
         def diff(t, y, args):
-            return jnp.diag(jnp.broadcast_to(self.diffusion(y, t), (self.dim,)))
+            return jnp.diag(jnp.broadcast_to(self.diffusion(y, t, condition_mask), (self.dim,)))
 
         def drift(t, y, args):
-            return self.drift(y, t)
+            return self.drift(y, t, condition_mask, score_args=score_args)
 
         rng, key = jax.random.split(rng)
-        y0s = jnp.squeeze(self.forward_sde.prior_sample(key, (n_samples,)))
+
+        y0s = jnp.squeeze(self.forward_sde.prior_sample(key, (n_samples,))) # squeeze shouldn't be needed, but it's staying there till i figure this thing out
+        y0s = y0s * (1-condition_mask) + condition_value * condition_mask
 
         keys = jax.random.split(rng, n_samples)
 
@@ -230,11 +288,11 @@ class VPSDE(BaseSDE):
         """
         return self.mean_coeff(t) * x0
     
-    def marginal_std(self, x0, t):
+    def marginal_stddev(self, x0, t):
         """
         Standard deviation of the marginal distribution.
         """
-        return jnp.sqrt(self.variance(t))
+        return jnp.broadcast_to(jnp.sqrt(self.variance(t)),x0.shape)
 
     def variance(self, t):
         """
@@ -242,58 +300,12 @@ class VPSDE(BaseSDE):
         returns v_t as above
         """
         return 1 - jnp.exp(-self.alpha_t(t))
-
-    def marginal_dist(self, x0, t):
-        """
-        Marginal probability of the VPSDE.
-        """
-        mean_coeff = self.mean_coeff(t)
-        var_coeff = self.variance(t)
-        std = jnp.sqrt(var_coeff)
-        covar = jnp.diag(std)
-        return dist.MultivariateNormal(loc=mean_coeff * x0, covariance_matrix=covar)
   
     def reverse(self, score):
         """
         Return the reverse VPSDE.
         """
         return R_VPSDE(self, score, self.dim)
-
-    def get_loss_function(self, weight_fn: Callable = None):
-        """
-        Get the loss function for denoising score matching.
-        """
-        if weight_fn is None:
-            # according to https://arxiv.org/abs/2101.09258 , for MLE we use g(t)**2 as weight function
-            weight_fn = lambda t: self.diffusion(1.0, t)**2 
-
-        
-        def loss_fn(score_model, x0, loss_mask=None, *args, rng, **kwargs):
-            N_batch = x0.shape[0]
-            rng, step_key = random.split(rng)
-            t = random.randint(step_key, (N_batch, 1), 1, self.diff_steps) / (
-                self.diff_steps - 1
-            )
-            mean_coeff = self.mean_coeff(t)
-            vs = self.variance(t)
-            stds = jnp.sqrt(vs)
-            rng, step_key = random.split(rng)
-            noise = random.normal(step_key, x0.shape)
-            xt = x0 * mean_coeff + noise * stds
-
-            # if the loss_mask is not None, we use it to mask some features, effectively conditioning on them
-            if loss_mask is not None:
-                loss_mask = loss_mask.reshape(x0.shape)
-                xt = jnp.where(loss_mask, x0, xt)
-
-            score_pred = score_model(xt, t, *args, **kwargs)
-            weight = weight_fn(t)
-            loss = weight*(noise + score_pred * stds) ** 2
-            if loss_mask is not None:
-                loss = jnp.where(loss_mask, 0.0,loss)
-            loss = jnp.mean(loss)
-
-        return loss_fn
 
     def _tree_flatten(self):
 
@@ -375,9 +387,9 @@ class VESDE(BaseSDE):
         """
         Mean of the marginal distribution.
         """
-        return jnp.broadcast_to(self.mean_coeff(t), x0.shape) * x0
+        return self.mean_coeff(t) * x0
     
-    def marginal_std(self, x0, t):
+    def marginal_stddev(self, x0, t):
         """
         Standard deviation of the marginal distribution.
         """
@@ -397,60 +409,6 @@ class VESDE(BaseSDE):
         Return the reverse VPSDE.
         """
         return R_VESDE(self, score, self.dim)
-    
-    def get_loss_function(self, weight_fn: Callable = None):
-        """
-        Get the loss function for denoising score matching.
-        """
-        if weight_fn is None:
-            # according to https://arxiv.org/abs/2101.09258 , for MLE we use g(t)**2 as weight function
-            weight_fn = lambda t: self.diffusion(1.0, t)**2 
-
-        # def loss_fn(score_model, x0, loss_mask=None, *args, rng, **kwargs):
-        #     N_batch = x0.shape[0]
-        #     rng, step_key = random.split(rng)
-        #     t = random.randint(step_key, (N_batch, 1), 1, self.diff_steps) / (
-        #         self.diff_steps - 1
-        #     )
-        #     mean_coeff = self.mean_coeff(t)
-        #     # directly compute sdt, as it is given by sigma(t)
-        #     stds = self.sigma(t)
-        #     rng, step_key = random.split(rng)
-        #     noise = random.normal(step_key, x0.shape)
-        #     xt = x0 * mean_coeff + noise * stds
-        #     score_val = score_model(xt, t, *args, **kwargs)
-        #     weight = weight_fn(t)
-        #     loss = jnp.sum(weight*(noise + score_val * stds) ** 2)
-        #     return loss
-
-        def loss_fn(score_model, x0, loss_mask=None, *args, rng, **kwargs):
-            N_batch = x0.shape[0]
-            rng, step_key = random.split(rng)
-            t = random.randint(step_key, (N_batch, 1), 1, self.diff_steps) / (
-                self.diff_steps - 1
-            )
-            mean_coeff = self.mean_coeff(t)
-            # directly compute sdt, as it is given by sigma(t)
-            stds = self.sigma(t)
-            rng, step_key = random.split(rng)
-            noise = random.normal(step_key, x0.shape)
-            xt = x0 * mean_coeff + noise * stds
-
-            # if the loss_mask is not None, we use it to mask some features, effectively conditioning on them
-            if loss_mask is not None:
-                loss_mask = loss_mask.reshape(x0.shape)
-                xt = jnp.where(loss_mask, x0, xt)
-
-            score_pred = score_model(xt, t, *args, **kwargs)
-            weight = weight_fn(t)
-            loss = weight*(noise + score_pred * stds) ** 2
-            if loss_mask is not None:
-                loss = jnp.where(loss_mask, 0.0,loss)
-            loss = jnp.mean(loss)
-    
-            return loss
-
-        return loss_fn
 
     def _tree_flatten(self):
 
