@@ -35,14 +35,13 @@ class AttentionBlock(nnx.Module):
         )
 
     def __call__(self, x: jnp.ndarray, mask: jnp.ndarray | None) -> jnp.ndarray:
-        x_in = self.layer_norm(x)
-        x = x_in
+        x_in = x
         x = self.attn(x, mask=mask)
 
         if self.skip_connection:
                 x = x + x_in
 
-        return x
+        return self.layer_norm(x)
 
 
 class DenseBlock(nnx.Module):
@@ -61,28 +60,34 @@ class DenseBlock(nnx.Module):
         n_features = din
         self.layer_norm = nnx.LayerNorm(din, rngs=rngs)
         self.hidden_blocks = []
-        for _ in range(num_hidden_layers):
-            self.hidden_blocks.append(
-                nnx.Linear(n_features, widening_factor * n_features, rngs=rngs)
-            )
-            n_features *= widening_factor
+        for i in range(num_hidden_layers):
+            if i == 0:
+                self.hidden_blocks.append(
+                    nnx.Linear(n_features, widening_factor * n_features, rngs=rngs)
+                )
+                n_features *= widening_factor
+            else:
+                self.hidden_blocks.append(
+                        nnx.Linear(n_features, n_features, rngs=rngs)
+                    )
 
         self.hidden_blocks.append(nnx.Linear(n_features, din, rngs=rngs))
         self.act = act
+        self.dropout_rate = dropout_rate
         self.dropout = nnx.Dropout(rate=dropout_rate)
         self.context_block = nnx.Linear(dcontext, din, rngs=rngs)
         return
 
     def __call__(self, x, context):
-        x_in = self.layer_norm(x)
-        x = x_in
+        x_in = x
 
-        for _ in range(len(self.hidden_blocks) - 1):
-            x = self.hidden_blocks[_](x)
+        for i in range(len(self.hidden_blocks) - 1):
+            x = self.hidden_blocks[i](x)
             x = self.act(x)
 
         x = self.hidden_blocks[-1](x)
-        x = self.dropout(x)
+        if self.dropout_rate > 0:
+            x = self.dropout(x)
 
         if context is not None:
             context_emb = self.context_block(context)
@@ -95,7 +100,7 @@ class DenseBlock(nnx.Module):
         if self.skip_connection:
             x = x + x_in
 
-        return x
+        return self.layer_norm(x)
 
 
 class Transformer(nnx.Module):
@@ -108,12 +113,13 @@ class Transformer(nnx.Module):
         num_heads: int,
         num_layers: int,
         features: int,
-        dropout_rate: float,
-        widening_factor: int,
-        num_hidden_layers: int,
-        act: Callable,
-        skip_connection_attn: bool,
-        skip_connection_mlp: bool,
+        dropout_rate: float = 0,
+        widening_factor: int = 4,
+        num_hidden_layers: int = 1,
+        act: Callable = jax.nn.gelu,
+        skip_connection_attn: bool = True,
+        skip_connection_mlp: bool = True,
+        *, # Enforce keyword arguments
         rngs: nnx.Rngs,
     ):
         self.din = din
@@ -132,6 +138,7 @@ class Transformer(nnx.Module):
         # now we define attention and dense blocks
         self.attention_blocks = []
         self.dense_blocks = []
+        self.layer_norm = nnx.LayerNorm(din, rngs=rngs)
 
         for _ in range(num_layers):
             self.attention_blocks.append(
@@ -178,5 +185,6 @@ class Transformer(nnx.Module):
             x = self.attention_blocks[i](x, mask)
             x = self.dense_blocks[i](x, context)
 
-        return x
+        out = self.layer_norm(x)
+        return out
 

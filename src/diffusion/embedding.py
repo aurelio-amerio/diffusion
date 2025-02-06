@@ -1,6 +1,7 @@
 import jax
 from jax import numpy as jnp
 from flax import nnx
+import numpy as np
 
 class SimpleTimeEmbedding(nnx.Module):
     def __init__(self):
@@ -100,7 +101,9 @@ class GaussianFourierEmbedding(nnx.Module):
         self.output_dim = output_dim
         half_dim = self.output_dim // 2 + 1
         self.B = nnx.Param(jax.random.normal(rngs.params(), [half_dim , 1]))
-        self.learnable = learnable
+        if not learnable:
+            self.B = jax.lax.stop_gradient(self.B)
+   
         return
 
         

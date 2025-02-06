@@ -159,13 +159,14 @@ class ReverseSDE(abc.ABC):
         """
         Drift function of the reverse SDE.
         """
+        x = jnp.atleast_2d(x)
+        t = jnp.atleast_1d(t)
         forward_drift = self.forward_sde.drift
         diffusion = self.forward_sde.diffusion
         # to obtain a process for the reverse time, we need to reverse the drift and diffusion of the forward sde
         res = forward_drift(x, t) - jnp.multiply(
-            jnp.square(diffusion(x, t)), jnp.squeeze(self.score(x, t, **score_args))
-        )
-        return res*(1-condition_mask)
+            jnp.square(diffusion(x, t)), self.score(jnp.atleast_2d(x), t, **score_args))
+        return jnp.squeeze(res)*(1-condition_mask)
 
     def diffusion(self, x, t, condition_mask=0):
         """
@@ -195,7 +196,7 @@ class ReverseSDE(abc.ABC):
 
         rng, key = jax.random.split(rng)
 
-        y0s = jnp.squeeze(self.forward_sde.prior_sample(key, (n_samples,))) # squeeze shouldn't be needed, but it's staying there till i figure this thing out
+        y0s = jnp.squeeze(self.forward_sde.prior_sample(key, (n_samples,))) # squeeze shouldn't be needed, but it's staying for compatibility
         y0s = y0s * (1-condition_mask) + condition_value * condition_mask
 
         keys = jax.random.split(rng, n_samples)
