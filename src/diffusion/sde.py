@@ -28,7 +28,7 @@ from typing import Callable
 
 
 class BaseSDE(abc.ABC):
-    def __init__(self, dim, prior_dist: dist.Distribution, diff_steps: int=1000):
+    def __init__(self, dim, prior_dist: dist.Distribution, diff_steps: int = 1000):
         self.dim = dim
         self._prior_dist = prior_dist
         self._diff_steps = diff_steps
@@ -82,7 +82,6 @@ class BaseSDE(abc.ABC):
         """
         pass
 
-
     @property
     def prior_dist(self) -> dist.Distribution:
         """The prior distribution."""
@@ -107,15 +106,15 @@ class BaseSDE(abc.ABC):
         """
         if weight_fn is None:
             # according to https://arxiv.org/abs/2101.09258 , for MLE we use g(t)**2 as weight function
-            weight_fn = lambda t: self.diffusion(1.0, t)**2 
+            weight_fn = lambda t: self.diffusion(1.0, t) ** 2
 
-        
         def loss_fn(score_model, x0, loss_mask=None, *args, rng, **kwargs):
             N_batch = x0.shape[0]
+            t_shape = (N_batch,) + (1,) * (x0.ndim - 1)
+            # t needs to have the same number of dimensions as x0, so we broadcast it
             rng, step_key = random.split(rng)
-            t = random.randint(step_key, (N_batch, 1), 1, self.diff_steps) / (
-                self.diff_steps - 1
-            )
+            T_min = 1 / self.diff_steps
+            t = jax.random.uniform(step_key, t_shape, minval=T_min, maxval=1.0)
 
             mean_t = self.marginal_mean(x0, t)
             std_t = self.marginal_stddev(x0, t)
@@ -124,18 +123,20 @@ class BaseSDE(abc.ABC):
             noise = random.normal(step_key, x0.shape)
             xt = mean_t + noise * std_t
 
-            # if the loss_mask is not None, we use it to mask some features, effectively conditioning on them
+            # if the loss_mask is not None, we use it to mask some features, effectively conditioning on them
             if loss_mask is not None:
                 loss_mask = loss_mask.reshape(x0.shape)
                 xt = jnp.where(loss_mask, x0, xt)
 
             score_pred = score_model(xt, t, *args, **kwargs)
+            score_target = -noise / std_t
             weight = weight_fn(t)
-            loss = weight*(noise + score_pred * std_t) ** 2
-            if loss_mask is not None:
-                loss = jnp.where(loss_mask, 0.0,loss)
 
+            loss = weight * jnp.sum((score_pred - score_target) ** 2, axis=-1, keepdims=True)
+            if loss_mask is not None:
+                loss = jnp.where(loss_mask, 0.0, loss)
             loss = jnp.mean(loss)
+
             return loss
 
         return loss_fn
@@ -155,7 +156,7 @@ class ReverseSDE(abc.ABC):
         self.forward_sde = forward_sde
         self.score = score
 
-    def drift(self, x, t, condition_mask=0, score_args={}):
+    def drift(self, x, t, condition_mask=0, replace_conditioned=True, score_args={}):
         """
         Drift function of the reverse SDE.
         """
@@ -164,46 +165,68 @@ class ReverseSDE(abc.ABC):
         forward_drift = self.forward_sde.drift
         diffusion = self.forward_sde.diffusion
         # to obtain a process for the reverse time, we need to reverse the drift and diffusion of the forward sde
-        res = forward_drift(x, t) - jnp.multiply(
-            jnp.square(diffusion(x, t)), self.score(jnp.atleast_2d(x), t, **score_args))
-        return jnp.squeeze(res,axis=0)*(1-condition_mask)
+        res = forward_drift(x, t) - diffusion(x, t)**2 *self.score(jnp.atleast_2d(x), t, **score_args)
+        if replace_conditioned:
+            res = res * (1 - condition_mask)
+        return jnp.squeeze(res, axis=0) # remove the extra dimension
 
-    def diffusion(self, x, t, condition_mask=0):
+    def diffusion(self, x, t, condition_mask=0, replace_conditioned=True):
         """
         Diffusion function of the reverse SDE.
         """
-        return self.forward_sde.diffusion(x, t)*(1-condition_mask)
+        res = self.forward_sde.diffusion(x, t)
+        if replace_conditioned:
+            res = res * (1 - condition_mask)
+        return res
 
-    def sample(self, rng, n_samples, condition_mask=None, condition_value=None, solver=Euler(), safe=True, n_steps=1000, eps=0.001, score_args={}):
+    def sample(
+        self,
+        rng,
+        n_samples,
+        condition_mask=None,
+        condition_value=None,
+        solver=Euler(),
+        safe=True,
+        n_steps=1000,
+        replace_conditioned=True,
+        score_args={},
+    ):
         """
         Sample from the reverse SDE.
         """
-        t0, t1 = self.forward_sde.T, eps #we are going from T to eps in the reverse process
+        t0 = self.forward_sde.T
+        t1 = 1 / n_steps
         dt = -t0 / n_steps
 
         if condition_mask is not None:
-            assert condition_value is not None, "Condition value must be provided if condition mask is provided"
+            assert (
+                condition_value is not None
+            ), "Condition value must be provided if condition mask is provided"
         else:
             condition_mask = 0
-            condition_value = 0 
-        
+            condition_value = 0
 
         def diff(t, y, args):
-            return jnp.diag(jnp.broadcast_to(self.diffusion(y, t, condition_mask), (self.dim,)))
+            return jnp.diag(
+                jnp.broadcast_to(self.diffusion(y, t, condition_mask,replace_conditioned), (self.dim,))
+            )
 
         def drift(t, y, args):
-            return self.drift(y, t, condition_mask, score_args=score_args)
+            return self.drift(y, t, condition_mask, replace_conditioned, score_args=score_args)
 
         rng, key = jax.random.split(rng)
 
         y0s = self.forward_sde.prior_sample(key, (n_samples,))
-        y0s = y0s * (1-condition_mask) + condition_value * condition_mask
+        if replace_conditioned:
+            y0s = y0s * (1 - condition_mask) + condition_value * condition_mask
 
         keys = jax.random.split(rng, n_samples)
 
         @jit
         def sample_one(key, y0):
-            brownian_motion = VirtualBrownianTree(t1, t0, tol=1e-5, shape=(self.dim,), key=key)
+            brownian_motion = VirtualBrownianTree(
+                t1, t0, tol=1e-5, shape=(self.dim,), key=key
+            )
             terms = MultiTerm(ODETerm(drift), ControlTerm(diff, brownian_motion))
             sol = diffeqsolve(terms, solver, t0, t1, dt0=dt, y0=y0)
             return sol.ys
@@ -239,7 +262,9 @@ class VPSDE(BaseSDE):
     Variance Preseverving SDE, also known as the Ornstein-Uhlenbeck SDE.
     """
 
-    def __init__(self, dim, beta_min: float = 0.001, beta_max: float = 3., diff_steps=1000):
+    def __init__(
+        self, dim, beta_min: float = 0.001, beta_max: float = 3.0, diff_steps=1000
+    ):
         prior_dist = dist.MultivariateNormal(
             loc=jnp.zeros(dim), covariance_matrix=jnp.eye(dim)
         )
@@ -247,7 +272,7 @@ class VPSDE(BaseSDE):
         self.beta_min = beta_min
         self.beta_max = beta_max
         return
-    
+
     @property
     def T(self):
         return 1
@@ -282,26 +307,26 @@ class VPSDE(BaseSDE):
         returns m_t as above
         """
         return jnp.exp(-0.5 * self.alpha_t(t))
-    
+
     def marginal_mean(self, x0, t):
         """
         Mean of the marginal distribution.
         """
         return self.mean_coeff(t) * x0
-    
+
     def marginal_stddev(self, x0, t):
         """
         Standard deviation of the marginal distribution.
         """
-        return jnp.broadcast_to(jnp.sqrt(self.variance(t)),x0.shape)
+        return jnp.broadcast_to(jnp.sqrt(self.marginal_variance(t)), x0.shape)
 
-    def variance(self, t):
+    def marginal_variance(self, t):
         """
         t: time (number)
         returns v_t as above
         """
         return 1 - jnp.exp(-self.alpha_t(t))
-  
+
     def reverse(self, score):
         """
         Return the reverse VPSDE.
@@ -312,7 +337,12 @@ class VPSDE(BaseSDE):
 
         children = (None,)  # arrays / dynamic values
 
-        aux_data = {"dim": self.dim, "prior_dist": self.prior_dist, "beta_min":self.beta_min, "beta_max": self.beta_max}  # static values
+        aux_data = {
+            "dim": self.dim,
+            "prior_dist": self.prior_dist,
+            "beta_min": self.beta_min,
+            "beta_max": self.beta_max,
+        }  # static values
 
         return (children, aux_data)
 
@@ -333,7 +363,7 @@ class R_VPSDE(ReverseSDE):
         }  # static values
 
         return (children, aux_data)
-    
+
 
 def get_exponential_sigma_function(sigma_min, sigma_max):
     log_sigma_min = jnp.log(sigma_min)
@@ -345,7 +375,7 @@ def get_exponential_sigma_function(sigma_min, sigma_max):
         return jnp.exp(log_sigma_min + t * (log_sigma_max - log_sigma_min))
 
     return sigma
-    
+
 
 class VESDE(BaseSDE):
     """Variance exploding (VE) SDE, a.k.a. diffusion process with a time dependent diffusion coefficient."""
@@ -354,7 +384,7 @@ class VESDE(BaseSDE):
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
         prior_dist = dist.MultivariateNormal(
-            loc=jnp.zeros(dim), covariance_matrix=self.sigma_max*jnp.eye(dim)
+            loc=jnp.zeros(dim), covariance_matrix=self.sigma_max * jnp.eye(dim)
         )
         super().__init__(dim, prior_dist, diff_steps)
         self.sigma = get_exponential_sigma_function(sigma_min, sigma_max)
@@ -375,21 +405,22 @@ class VESDE(BaseSDE):
         Diffusion function of the SDE.
         """
         sigma_t = self.sigma(t)
-        return sigma_t * jnp.sqrt(2 * (jnp.log(self.sigma_max) - jnp.log(self.sigma_min)))
-    
+        return sigma_t * jnp.sqrt(
+            2 * (jnp.log(self.sigma_max) - jnp.log(self.sigma_min))
+        )
 
     def mean_coeff(self, t):
         return jnp.ones_like(t)
 
-    def variance(self, t):
+    def marginal_variance(self, t):
         return self.sigma(t) ** 2
-    
+
     def marginal_mean(self, x0, t):
         """
         Mean of the marginal distribution.
         """
         return self.mean_coeff(t) * x0
-    
+
     def marginal_stddev(self, x0, t):
         """
         Standard deviation of the marginal distribution.
@@ -414,9 +445,15 @@ class VESDE(BaseSDE):
     def _tree_flatten(self):
 
         children = (None,)  # arrays / dynamic values
-        aux_data = {"dim": self.dim, "prior_dist": self.prior_dist,"sigma_min":self.sigma_min, "sigma_max":self.sigma_max}  # static values
+        aux_data = {
+            "dim": self.dim,
+            "prior_dist": self.prior_dist,
+            "sigma_min": self.sigma_min,
+            "sigma_max": self.sigma_max,
+        }  # static values
 
         return (children, aux_data)
+
 
 class R_VESDE(ReverseSDE):
     def __init__(self, forward_sde, score, dim, **kwargs):
