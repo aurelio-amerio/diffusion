@@ -35,13 +35,13 @@ class AttentionBlock(nnx.Module):
         )
 
     def __call__(self, x: jnp.ndarray, mask: jnp.ndarray | None) -> jnp.ndarray:
+        x = self.layer_norm(x)
         x_in = x
         x = self.attn(x, mask=mask)
 
         if self.skip_connection:
-                x = x + x_in
-
-        return self.layer_norm(x)
+            x = x + x_in
+        return x
 
 
 class DenseBlock(nnx.Module):
@@ -60,16 +60,15 @@ class DenseBlock(nnx.Module):
         n_features = din
         self.layer_norm = nnx.LayerNorm(din, rngs=rngs)
         self.hidden_blocks = []
-        for i in range(num_hidden_layers):
-            if i == 0:
-                self.hidden_blocks.append(
+        self.hidden_blocks.append(
                     nnx.Linear(n_features, widening_factor * n_features, rngs=rngs)
                 )
-                n_features *= widening_factor
-            else:
-                self.hidden_blocks.append(
-                        nnx.Linear(n_features, n_features, rngs=rngs)
-                    )
+        n_features *= widening_factor
+        
+        for i in range(1, num_hidden_layers):
+            self.hidden_blocks.append(
+                    nnx.Linear(n_features, n_features, rngs=rngs)
+                )
 
         self.hidden_blocks.append(nnx.Linear(n_features, din, rngs=rngs))
         self.act = act
@@ -79,7 +78,9 @@ class DenseBlock(nnx.Module):
         return
 
     def __call__(self, x, context):
+        x = self.layer_norm(x)
         x_in = x
+
 
         for i in range(len(self.hidden_blocks) - 1):
             x = self.hidden_blocks[i](x)
@@ -100,7 +101,7 @@ class DenseBlock(nnx.Module):
         if self.skip_connection:
             x = x + x_in
 
-        return self.layer_norm(x)
+        return x
 
 
 class Transformer(nnx.Module):
