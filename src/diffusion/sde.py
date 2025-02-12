@@ -32,6 +32,7 @@ class BaseSDE(abc.ABC):
         self.dim = dim
         self._prior_dist = prior_dist
         self._diff_steps = diff_steps
+        self.scale_min = None
         return
 
     @property
@@ -141,6 +142,16 @@ class BaseSDE(abc.ABC):
 
         return loss_fn
 
+    def get_output_scale_fn(self, scale_min=None):
+        if scale_min is None:
+            assert not self.scale_min is None, "scale_min must be implemented in the SDE class or provided as an argument"
+            scale_min = self.scale_min
+        def output_scale_fn(t, x):
+            scale = jnp.clip(jnp.sqrt(jnp.sum(self.marginal_variance(t[..., None])*jnp.ones(x.shape), -1)), scale_min)
+            return 1/scale[..., None] * x
+        
+        return output_scale_fn
+    
     @abc.abstractmethod
     def _tree_flatten(self):
         pass
@@ -271,6 +282,7 @@ class VPSDE(BaseSDE):
         super().__init__(dim, prior_dist, diff_steps)
         self.beta_min = beta_min
         self.beta_max = beta_max
+        self.scale_min = 0.
         return
 
     @property
@@ -388,6 +400,7 @@ class VESDE(BaseSDE):
         )
         super().__init__(dim, prior_dist, diff_steps)
         self.sigma = get_exponential_sigma_function(sigma_min, sigma_max)
+        self.scale_min = 1e-3
 
     @property
     def T(self):
@@ -435,6 +448,7 @@ class VESDE(BaseSDE):
         std = self.sigma(t)
         covar = jnp.diag(std)
         return dist.MultivariateNormal(loc=mean_coeff * x0, covariance_matrix=covar)
+    
 
     def reverse(self, score):
         """
