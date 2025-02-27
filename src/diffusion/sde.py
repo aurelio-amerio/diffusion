@@ -14,6 +14,11 @@ class AbstractSDE(abc.ABC):
     def __init__(self):
         pass
 
+    @property
+    @abc.abstractmethod
+    def name(self):
+        pass
+
     @abc.abstractmethod
     def time_schedule(self, u):
         # given the value of the random uniform variable u ~ U(0,1), return the time t in the schedule
@@ -29,7 +34,12 @@ class AbstractSDE(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def sigma_prime(self, t):
+    def sigma_inv(self, sigma):
+        # sigma_inv(sigma)=t
+        pass
+
+    @abc.abstractmethod
+    def sigma_deriv(self, t):
         # also known as the schedule derivative
         pass
 
@@ -39,7 +49,7 @@ class AbstractSDE(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def s_prime(self, t):
+    def s_deriv(self, t):
         # also known as scaling derivative
         pass
 
@@ -81,11 +91,11 @@ class AbstractSDE(abc.ABC):
 
     def f(self, x, t):
         # f(x, sigma) in the SDE, also known as drift term for the forward diffusion process
-        return x * self.s_prime(t) / self.s(t)
+        return x * self.s_deriv(t) / self.s(t)
 
-    def g(self, t):
+    def g(self, x, t):
         # g(sigma) in the SDE, also known as diffusion term for the forward diffusion process
-        return self.s(t) * jnp.sqrt(2 * self.sigma_prime(t) * self.sigma(t))
+        return self.s(t) * jnp.sqrt(2 * self.sigma_deriv(t) * self.sigma(t))
 
     def denoise(self, F, x, sigma, *args, **kwargs):
         # denoise function, D in the EDM paper, which shares a connection with the score function:
@@ -99,13 +109,15 @@ class AbstractSDE(abc.ABC):
 
     def get_score_function(self, F):
         # score function, ∇_x log p(x; σ) = (D(x; σ) − x)/σ^2
-        def score(x, t):
+        def score(x, u, *args, **kwargs):
+            t = self.time_schedule(u)
+            # t = u
             sigma = self.sigma(t)
-            return (self.denoise(x, sigma, F) - x) / (sigma**2)
+            return (self.denoise(F, x, sigma, *args, **kwargs) - x) / (sigma**2)
 
         return score
 
-    def get_denoising_loss(self):  # TODO add conditioning
+    def get_denoising_loss(self):
 
         def loss_fn(F, x0, loss_mask=None, *args, rng, **kwargs):
             # a typical trainig loop will sample t from Unif(eps, 1), then get sigma(t) and compute the loss
@@ -113,7 +125,7 @@ class AbstractSDE(abc.ABC):
 
             key_sigma, key_noise = random.split(rng)
 
-            sigma = self.sample_sigma(key_sigma, x0.shape[0])
+            sigma = self.sample_sigma(key_sigma, x0.shape[0])[...,None]
 
             lam = self.loss_weight(sigma)
             c_out = self.c_out(sigma)
@@ -146,14 +158,19 @@ class AbstractSDE(abc.ABC):
 
 
 class VP(AbstractSDE):
-    def __init__(self, beta_min=0.1, beta_d=19.9, e_s=1e-3, e_t=1e-5, M=1000):
+    def __init__(self, beta_min=0.1, beta_max=20.0, e_s=1e-3, e_t=1e-5, M=1000):
         super().__init__()
         self.beta_min = beta_min
-        self.beta_d = beta_d
+        self.beta_max = beta_max
+        self.beta_d = beta_max - beta_min
         self.e_s = e_s
         self.e_t = e_t
         self.M = M
         return
+    
+    @property
+    def name(self):
+        return "VP"
 
     def time_schedule(self, u):
         return 1 + u * (self.e_s - 1)
@@ -168,7 +185,7 @@ class VP(AbstractSDE):
             - self.beta_min
         ) / self.beta_d
 
-    def sigma_prime(self, t):
+    def sigma_deriv(self, t):
         # also known as the schedule derivative
         return (
             0.5
@@ -180,9 +197,17 @@ class VP(AbstractSDE):
         # also known as scaling, as in tab 1 of EDM paper
         return 1 / jnp.sqrt(jnp.exp(0.5 * self.beta_d * t**2 + self.beta_min * t))
 
-    def s_prime(self, t):
+    def s_deriv(self, t):
         # also known as scaling derivative
         return jax.grad(self.s)(t)
+    
+    def f(self, x, t):
+        # f(x, sigma) in the SDE, also known as drift term for the forward diffusion process
+        return -x * 0.5*(self.beta_min + self.beta_d*t)
+
+    def g(self, x, t):
+        # g(sigma) in the SDE, also known as diffusion term for the forward diffusion process
+        return jnp.sqrt(self.beta_min + self.beta_d*t)
 
     def c_skip(self, sigma):
         # c_skip for preconditioning
@@ -210,6 +235,10 @@ class VE(AbstractSDE):
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
         return
+    
+    @property
+    def name(self):
+        return "VE"
 
     def time_schedule(self, u):
         return self.sigma_max**2 * (self.sigma_min / self.sigma_max) ** (2 * u)
@@ -217,15 +246,18 @@ class VE(AbstractSDE):
     def sigma(self, t):
         # also known as the schedule, as in tab 1 of EDM paper
         return jnp.sqrt(t)
+    
+    def sigma_inv(self, sigma):
+        return sigma**2
 
-    def sigma_prime(self, t):
+    def sigma_deriv(self, t):
         return 1 / (2 * jnp.sqrt(t))
 
     def s(self, t):
         # also known as scaling, as in tab 1 of EDM paper
         return 1
 
-    def s_prime(self, t):
+    def s_deriv(self, t):
         # also known as scaling derivative
         return 0
 
@@ -267,6 +299,10 @@ class EDM(AbstractSDE):
         self.P_mean = P_mean
         self.P_std = P_std
         return
+    
+    @property
+    def name(self):
+        return "EDM"
 
     def time_schedule(self, u):
         return (
@@ -277,8 +313,11 @@ class EDM(AbstractSDE):
     def sigma(self, t):
         # also known as the schedule, as in tab 1 of EDM paper
         return t
+    
+    def sigma_inv(self, sigma):
+        return sigma
 
-    def sigma_prime(self, t):
+    def sigma_deriv(self, t):
         # also known as the schedule derivative
         return 1
 
@@ -286,7 +325,7 @@ class EDM(AbstractSDE):
         # also known as scaling, as in tab 1 of EDM paper
         return 1
 
-    def s_prime(self, t):
+    def s_deriv(self, t):
         # also known as scaling derivative
         return 0
 

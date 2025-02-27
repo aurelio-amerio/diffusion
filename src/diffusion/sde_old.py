@@ -127,7 +127,7 @@ class BaseSDE(abc.ABC):
                 loss_mask = loss_mask.reshape(x0.shape)
                 xt = jnp.where(loss_mask, x0, xt)
 
-            score_pred = score_model(xt, jnp.ravel(t), *args, **kwargs)
+            score_pred = score_model(xt, t, *args, **kwargs)
             score_target = -noise / std_t
             loss = (score_pred - score_target) ** 2
             if loss_mask is not None:
@@ -192,6 +192,7 @@ class ReverseSDE(abc.ABC):
         self,
         rng,
         n_samples,
+        eps=1e-3,
         condition_mask=None,
         condition_value=None,
         solver=Euler(),
@@ -204,7 +205,7 @@ class ReverseSDE(abc.ABC):
         Sample from the reverse SDE.
         """
         t0 = self.forward_sde.T
-        t1 = 1 / n_steps
+        t1 = eps
         dt = -t0 / n_steps
 
         if condition_mask is not None:
