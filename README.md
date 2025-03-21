@@ -1,18 +1,13 @@
-# My Python Project
+# Diffusion models for SBI in JAX
 
 ## Overview
-This project is a Python application that serves as a template for building Python projects. It includes a main entry point and is structured to facilitate easy development and deployment.
+Very experimental library for SBI using Diffusion models. Currently a work in progress
 
-## Project Structure
-```
-my-python-project
-├── src
-│   ├── main.py
-│   └── __init__.py
-├── pyproject.toml
-├── requirements.txt
-└── README.md
-```
+## TODO
+- Score matching model for SBI # done
+- EDM model for SBI # WIP
+- Flow matching model, recrified flow and consistency flow # TODO
+
 
 ## Installation
 To install the required dependencies, run the following command:
@@ -21,15 +16,3 @@ To install the required dependencies, run the following command:
 pip install -r requirements.txt
 ```
 
-## Usage
-To run the application, execute the following command:
-
-```
-python src/main.py
-```
-
-## Contributing
-Contributions are welcome! Please open an issue or submit a pull request for any improvements or bug fixes.
-
-## License
-This project is licensed under the MIT License. See the LICENSE file for more details.
